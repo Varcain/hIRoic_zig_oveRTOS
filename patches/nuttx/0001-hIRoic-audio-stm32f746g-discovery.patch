@@ -1,0 +1,708 @@
+From a916558d80d7c41eb9b87f6d4205000091f12e58 Mon Sep 17 00:00:00 2001
+From: Kamil Lulko <kamil.lulko@gmail.com>
+Date: Thu, 5 Mar 2026 16:44:38 +0100
+Subject: [PATCH] hIRoic setup for STM32F746G-Discovery
+
+---
+ arch/arm/src/stm32f7/stm32_sai.c              |  98 ++++++++++++--
+ .../stm32f746g-disco/configs/hiroic/defconfig | 127 ++++++++++++++++++
+ .../stm32f7/stm32f746g-disco/include/board.h  |   9 ++
+ .../stm32f746g-disco/src/stm32_wm8994.c       |  93 +++++++++----
+ drivers/audio/wm8994.c                        | 115 +++++++++++-----
+ drivers/audio/wm8994.h                        |   2 +-
+ 6 files changed, 371 insertions(+), 73 deletions(-)
+ create mode 100644 boards/arm/stm32f7/stm32f746g-disco/configs/hiroic/defconfig
+
+diff --git a/arch/arm/src/stm32f7/stm32_sai.c b/arch/arm/src/stm32f7/stm32_sai.c
+index fbf25984db..bf397951e9 100644
+--- a/arch/arm/src/stm32f7/stm32_sai.c
++++ b/arch/arm/src/stm32f7/stm32_sai.c
+@@ -67,6 +67,7 @@
+ #include "stm32_gpio.h"
+ #include "stm32_sai.h"
+ #include "stm32_pwr.h"
++#include "stm32_dtcm.h"
+ 
+ #ifdef CONFIG_STM32F7_SAI
+ 
+@@ -144,25 +145,25 @@
+  * priority.
+  */
+ 
+-#  define SAI_RXDMA8_CONFIG   (DMA_SCR_PFCTRL | DMA_SCR_DIR_P2M|DMA_SCR_MINC | \
++#  define SAI_RXDMA8_CONFIG   (DMA_SCR_DIR_P2M | DMA_SCR_MINC | \
+                                   DMA_SCR_PSIZE_8BITS | DMA_SCR_MSIZE_8BITS | \
+-                                  DMA_SCR_PBURST_INCR4 | DMA_SCR_MBURST_INCR4)
+-#  define SAI_RXDMA16_CONFIG   (DMA_SCR_PFCTRL | DMA_SCR_DIR_P2M|DMA_SCR_MINC | \
++                                  DMA_SCR_PBURST_SINGLE | DMA_SCR_MBURST_SINGLE)
++#  define SAI_RXDMA16_CONFIG   (DMA_SCR_DIR_P2M | DMA_SCR_MINC | \
+                                   DMA_SCR_PSIZE_16BITS | DMA_SCR_MSIZE_16BITS | \
+-                                  DMA_SCR_PBURST_INCR4 | DMA_SCR_MBURST_INCR4)
+-#  define SAI_RXDMA32_CONFIG   (DMA_SCR_PFCTRL | DMA_SCR_DIR_P2M|DMA_SCR_MINC | \
++                                  DMA_SCR_PBURST_SINGLE | DMA_SCR_MBURST_SINGLE)
++#  define SAI_RXDMA32_CONFIG   (DMA_SCR_DIR_P2M | DMA_SCR_MINC | \
+                                   DMA_SCR_PSIZE_32BITS | DMA_SCR_MSIZE_32BITS | \
+-                                  DMA_SCR_PBURST_INCR4 | DMA_SCR_MBURST_INCR4)
++                                  DMA_SCR_PBURST_SINGLE | DMA_SCR_MBURST_SINGLE)
+ 
+ #  define SAI_TXDMA8_CONFIG    (DMA_SCR_DIR_M2P | DMA_SCR_MINC | \
+                                   DMA_SCR_PSIZE_8BITS | DMA_SCR_MSIZE_8BITS | \
+-                                  DMA_SCR_PBURST_INCR4 | DMA_SCR_MBURST_INCR4)
++                                  DMA_SCR_PBURST_SINGLE | DMA_SCR_MBURST_SINGLE)
+ #  define SAI_TXDMA16_CONFIG   (DMA_SCR_DIR_M2P | DMA_SCR_MINC | \
+                                   DMA_SCR_PSIZE_16BITS | DMA_SCR_MSIZE_16BITS | \
+-                                  DMA_SCR_PBURST_INCR4 | DMA_SCR_MBURST_INCR4)
++                                  DMA_SCR_PBURST_SINGLE | DMA_SCR_MBURST_SINGLE)
+ #  define SAI_TXDMA32_CONFIG   (DMA_SCR_DIR_M2P | DMA_SCR_MINC | \
+                                   DMA_SCR_PSIZE_32BITS | DMA_SCR_MSIZE_32BITS | \
+-                                  DMA_SCR_PBURST_INCR4 | DMA_SCR_MBURST_INCR4)
++                                  DMA_SCR_PBURST_SINGLE | DMA_SCR_MBURST_SINGLE)
+ #endif
+ 
+ /****************************************************************************
+@@ -250,6 +251,8 @@ static int      sai_receive(struct i2s_dev_s *dev, struct ap_buffer_s *apb,
+ static int      sai_send(struct i2s_dev_s *dev, struct ap_buffer_s *apb,
+                   i2s_callback_t callback, void *arg,
+                   uint32_t timeout);
++static int      sai_ioctl(struct i2s_dev_s *dev, int cmd,
++                  unsigned long arg);
+ 
+ /****************************************************************************
+  * Private Data
+@@ -270,6 +273,10 @@ static const struct i2s_ops_s g_i2sops =
+   .i2s_txsamplerate = sai_samplerate,
+   .i2s_txdatawidth  = sai_datawidth,
+   .i2s_send         = sai_send,
++
++  /* Ioctl */
++
++  .i2s_ioctl        = sai_ioctl,
+ };
+ 
+ /* SAI1 state */
+@@ -1532,7 +1539,10 @@ static void sai_portinitialize(struct stm32f7_sai_s *priv)
+   sai_modifyreg(priv, STM32F7_SAI_CR1_OFFSET, SAI_CR1_SYNCEN_MASK,
+                 priv->syncen);
+ 
+-  sai_modifyreg(priv, STM32F7_SAI_CR1_OFFSET, 0, SAI_CR1_OUTDRIV);
++  sai_modifyreg(priv, STM32F7_SAI_CR1_OFFSET,
++                SAI_CR1_MONO | SAI_CR1_CKSTR,
++                SAI_CR1_OUTDRIV | SAI_CR1_MONO |
++                (priv->syncen ? SAI_CR1_CKSTR : 0));
+ 
+   sai_modifyreg(priv, STM32F7_SAI_CR2_OFFSET, SAI_CR2_FTH_MASK,
+                 SAI_CR2_FTH_1QF);
+@@ -1551,6 +1561,74 @@ static void sai_portinitialize(struct stm32f7_sai_s *priv)
+   sai_dump_regs(priv, "After initialization");
+ }
+ 
++/****************************************************************************
++ * Name: sai_ioctl
++ *
++ * Description:
++ *   Handle I2S ioctls.  AUDIOIOC_ALLOCBUFFER / AUDIOIOC_FREEBUFFER are
++ *   serviced from the DTCM heap when available.
++ *
++ ****************************************************************************/
++
++static int sai_ioctl(struct i2s_dev_s *dev, int cmd, unsigned long arg)
++{
++  switch (cmd)
++    {
++      case AUDIOIOC_START:
++        {
++          /* SAI DMA transfers are started by enqueuebuffer, not here. */
++
++          return OK;
++        }
++
++      case AUDIOIOC_GETBUFFERINFO:
++        {
++          FAR struct ap_buffer_info_s *info =
++              (FAR struct ap_buffer_info_s *)arg;
++          info->nbuffers = 8;
++          info->buffer_size = 1024;
++          return OK;
++        }
++
++#ifdef HAVE_DTCM_HEAP
++      case AUDIOIOC_ALLOCBUFFER:
++        {
++          FAR struct audio_buf_desc_s *bufdesc =
++              (FAR struct audio_buf_desc_s *)arg;
++          int bufsize = sizeof(struct ap_buffer_s) + bufdesc->numbytes;
++          FAR struct ap_buffer_s *apb;
++
++          apb = mm_zalloc(g_dtcm_heap, bufsize);
++          if (apb == NULL)
++            {
++              return -ENOMEM;
++            }
++
++          apb->i.channels = 1;
++          apb->crefs      = 1;
++          apb->nmaxbytes  = bufdesc->numbytes;
++          apb->nbytes     = 0;
++          apb->flags      = 0;
++          apb->samp       = (FAR uint8_t *)(apb + 1);
++          nxmutex_init(&apb->lock);
++          *bufdesc->u.pbuffer = apb;
++          return sizeof(struct audio_buf_desc_s);
++        }
++
++      case AUDIOIOC_FREEBUFFER:
++        {
++          FAR struct audio_buf_desc_s *bufdesc =
++              (FAR struct audio_buf_desc_s *)arg;
++          mm_free(g_dtcm_heap, bufdesc->u.buffer);
++          return sizeof(struct audio_buf_desc_s);
++        }
++#endif
++
++      default:
++        return -ENOTTY;
++    }
++}
++
+ /****************************************************************************
+  * Public Functions
+  ****************************************************************************/
+diff --git a/boards/arm/stm32f7/stm32f746g-disco/configs/hiroic/defconfig b/boards/arm/stm32f7/stm32f746g-disco/configs/hiroic/defconfig
+new file mode 100644
+index 0000000000..7f0ec24fac
+--- /dev/null
++++ b/boards/arm/stm32f7/stm32f746g-disco/configs/hiroic/defconfig
+@@ -0,0 +1,127 @@
++#
++# This file is autogenerated: PLEASE DO NOT EDIT IT.
++#
++# You can use "make menuconfig" to make any modifications to the installed .config file.
++# You can then do "make savedefconfig" to generate a new defconfig file that includes your
++# modifications.
++#
++# CONFIG_NSH_DISABLE_IFCONFIG is not set
++# CONFIG_NSH_DISABLE_PS is not set
++# CONFIG_STM32F7_USE_LEGACY_PINMAP is not set
++# CONFIG_STM32F7_FB_CMAP is not set
++# CONFIG_STM32F7_LTDC_L2 is not set
++# CONFIG_LV_BUILD_EXAMPLES is not set
++# CONFIG_SPI_CALLBACK is not set
++CONFIG_ARCH="arm"
++CONFIG_ARCH_BOARD="stm32f746g-disco"
++CONFIG_ARCH_BOARD_STM32F746G_DISCO=y
++CONFIG_ARCH_BUTTONS=y
++CONFIG_ARCH_CHIP="stm32f7"
++CONFIG_ARCH_CHIP_STM32F746NG=y
++CONFIG_ARCH_CHIP_STM32F7=y
++CONFIG_ARCH_FPU=y
++CONFIG_ARCH_STACKDUMP=y
++CONFIG_ARMV7M_DCACHE=y
++CONFIG_ARMV7M_DCACHE_WRITETHROUGH=y
++CONFIG_ARMV7M_DTCM=y
++CONFIG_STM32F7_DTCMEXCLUDE=y
++CONFIG_ARMV7M_ICACHE=y
++
++# Audio subsystem
++CONFIG_AUDIO=y
++CONFIG_AUDIO_I2S=y
++CONFIG_AUDIO_WM8994=y
++CONFIG_AUDIO_DRIVER_SPECIFIC_BUFFERS=y
++CONFIG_AUDIO_FORMAT_RAW=y
++CONFIG_WM8994_NUM_BUFFERS=8
++CONFIG_WM8994_BUFFER_SIZE=1024
++CONFIG_DRIVERS_AUDIO=y
++CONFIG_STM32F7_SAI2=y
++CONFIG_STM32F7_SAI2_A=y
++CONFIG_STM32F7_SAI2_B=y
++CONFIG_STM32F7_SAI2_B_SYNC_WITH_A=y
++CONFIG_STM32F7_DMA2=y
++CONFIG_STM32F7_I2C3=y
++CONFIG_I2C=y
++
++# SD Card / Filesystem
++CONFIG_STM32F7_SDMMC1=y
++CONFIG_MMCSD=y
++CONFIG_MMCSD_SDIO=y
++CONFIG_FS_FAT=y
++
++# Display / LVGL
++CONFIG_STM32F7_LTDC=y
++CONFIG_STM32F7_LTDC_FB_BASE=0xc0000000
++CONFIG_STM32F7_LTDC_FB_SIZE=261120
++CONFIG_VIDEO_FB=y
++CONFIG_DRIVERS_VIDEO=y
++CONFIG_GRAPHICS_LVGL=y
++CONFIG_LV_USE_NUTTX=y
++CONFIG_LV_USE_CLIB_MALLOC=y
++CONFIG_LV_USE_CLIB_SPRINTF=y
++CONFIG_LV_USE_CLIB_STRING=y
++CONFIG_LV_USE_LOG=y
++CONFIG_LV_FONT_MONTSERRAT_32=y
++
++# SDRAM (for DSP buffers and framebuffer)
++CONFIG_STM32F7_FMC=y
++CONFIG_STM32F7_EXTERNAL_RAM=y
++CONFIG_HEAP2_BASE=0xC003FC00
++CONFIG_HEAP2_SIZE=8127488
++
++# Threading / Scheduling
++CONFIG_PTHREAD_MUTEX_TYPES=y
++CONFIG_POSIX_SEMAPHORES=y
++CONFIG_SCHED_WAITPID=y
++CONFIG_SCHED_LPWORK=y
++CONFIG_SCHED_HPWORK=y
++CONFIG_SCHED_HPWORKSTACKSIZE=8192
++
++# Board / System
++CONFIG_BOARD_LATE_INITIALIZE=y
++CONFIG_BOARD_LOOPSPERMSEC=43103
++CONFIG_BUILTIN=y
++CONFIG_DEBUG_FULLOPT=y
++CONFIG_DEBUG_SYMBOLS=y
++CONFIG_HAVE_CXX=y
++CONFIG_HAVE_CXXINITIALIZE=y
++CONFIG_INIT_ENTRYPOINT="hiroic_main"
++CONFIG_INTELHEX_BINARY=y
++CONFIG_LINE_MAX=64
++CONFIG_MM_REGIONS=3
++CONFIG_MQ_MAXMSGSIZE=256
++CONFIG_NSH_BUILTIN_APPS=y
++CONFIG_NSH_FILEIOSIZE=512
++CONFIG_NSH_READLINE=y
++CONFIG_PREALLOC_TIMERS=4
++CONFIG_RAM_SIZE=245760
++CONFIG_RAM_START=0x20010000
++CONFIG_RAW_BINARY=y
++CONFIG_RR_INTERVAL=200
++CONFIG_SPI=y
++CONFIG_START_DAY=6
++CONFIG_START_MONTH=12
++CONFIG_START_YEAR=2011
++CONFIG_STM32F7_USART1=y
++CONFIG_SYSTEM_NSH=y
++CONFIG_TASK_NAME_SIZE=0
++CONFIG_USART1_SERIAL_CONSOLE=y
++
++# Procfs
++CONFIG_FS_PROCFS=y
++CONFIG_FS_PROCFS_REGISTER=y
++
++# Syslog
++CONFIG_SYSLOG_CHAR=y
++CONFIG_SYSLOG_DEVPATH="/dev/ttyS0"
++
++# Host
++CONFIG_HOST_LINUX=y
++
++# Stack sizes
++CONFIG_INIT_STACKSIZE=16384
++CONFIG_DEFAULT_TASK_STACKSIZE=4096
++
++# hIRoic application
++CONFIG_EXTERNAL_HIROIC=y
+diff --git a/boards/arm/stm32f7/stm32f746g-disco/include/board.h b/boards/arm/stm32f7/stm32f746g-disco/include/board.h
+index b390498974..9bb61a0634 100644
+--- a/boards/arm/stm32f7/stm32f746g-disco/include/board.h
++++ b/boards/arm/stm32f7/stm32f746g-disco/include/board.h
+@@ -281,6 +281,15 @@
+ #  define STM32_SDMMC_SDXFR_CLKDIV   (2 << STM32_SDMMC_CLKCR_CLKDIV_SHIFT)
+ #endif
+ 
++/* SDMMC1 pin definitions (directly from pinmap with speed) */
++
++#define GPIO_SDMMC1_CK  (GPIO_SDMMC1_CK_0|GPIO_SPEED_50MHz)
++#define GPIO_SDMMC1_CMD (GPIO_SDMMC1_CMD_0|GPIO_SPEED_50MHz)
++#define GPIO_SDMMC1_D0  (GPIO_SDMMC1_D0_0|GPIO_SPEED_50MHz)
++#define GPIO_SDMMC1_D1  (GPIO_SDMMC1_D1_0|GPIO_SPEED_50MHz)
++#define GPIO_SDMMC1_D2  (GPIO_SDMMC1_D2_0|GPIO_SPEED_50MHz)
++#define GPIO_SDMMC1_D3  (GPIO_SDMMC1_D3_0|GPIO_SPEED_50MHz)
++
+ /* LED definitions **********************************************************/
+ 
+ /* The STM32F746G-DISCO board has numerous LEDs but only one, LD1 located
+diff --git a/boards/arm/stm32f7/stm32f746g-disco/src/stm32_wm8994.c b/boards/arm/stm32f7/stm32f746g-disco/src/stm32_wm8994.c
+index cbc96730e4..7b065e3198 100644
+--- a/boards/arm/stm32f7/stm32f746g-disco/src/stm32_wm8994.c
++++ b/boards/arm/stm32f7/stm32f746g-disco/src/stm32_wm8994.c
+@@ -34,8 +34,8 @@
+ 
+ #include <nuttx/irq.h>
+ #include <nuttx/i2c/i2c_master.h>
++#include <nuttx/audio/audio_i2s.h>
+ #include <nuttx/audio/i2s.h>
+-#include <nuttx/audio/pcm.h>
+ #include <nuttx/audio/wm8994.h>
+ 
+ #include <arch/board/board.h>
+@@ -47,11 +47,13 @@
+ #include "stm32_sai.h"
+ #include "stm32_pwr.h"
+ #include "stm32_rcc.h"
++#include "stm32_dtcm.h"
+ 
+ #define HAVE_WM8994
+ #define WM8994_I2C_ADDRESS (0x34 >> 1)
+ #define WM8994_I2C_BUS  3
+-#define WM8994_SAI_BUS  2
++#define WM8994_SAI_BUS  2    /* SAI2 Block A (TX/playback) */
++#define WM8994_SAI_RX   3    /* SAI2 Block B (RX/recording) */
+ 
+ #ifdef HAVE_WM8994
+ 
+@@ -221,11 +223,12 @@ static uint32_t stm32_wm8994_sampleratecb(struct i2s_dev_s *dev,
+ int stm32_wm8994_initialize(int minor)
+ {
+   struct audio_lowerhalf_s *wm8994;
+-  struct audio_lowerhalf_s *pcm;
++  struct audio_lowerhalf_s *play_dev;
++  struct audio_lowerhalf_s *record_dev;
+   struct i2c_master_s *i2c;
+-  struct i2s_dev_s *i2s;
++  struct i2s_dev_s *i2s_tx;
++  struct i2s_dev_s *i2s_rx;
+   static bool initialized = false;
+-  char devname[12];
+   int ret;
+ 
+   audinfo("minor %d\n", minor);
+@@ -235,11 +238,9 @@ int stm32_wm8994_initialize(int minor)
+ 
+   if (!initialized)
+     {
+-      /* Configure MC01 to drive the master clock of the CODEC at 8MHz */
++      /* Initialize the DTCM heap for DMA-safe audio buffer allocation */
+ 
+-      /* stm32_configgpio(GPIO_MCO1);
+-       * stm32_mco1config(RCC_CFGR_MCO1_HSE, RCC_CFGR_MCO1PRE_NONE);
+-       */
++      dtcm_initialize();
+ 
+       /* Get an instance of the I2C interface for the CODEC */
+ 
+@@ -251,21 +252,39 @@ int stm32_wm8994_initialize(int minor)
+           goto error;
+         }
+ 
+-      /* Get an instance of the I2S interface for the CODEC data streams */
++      /* Get an instance of the I2S/SAI interface for TX (playback) */
+ 
+-      i2s = stm32_sai_initialize(WM8994_SAI_BUS, stm32_wm8994_sampleratecb);
+-      if (!i2s)
++      i2s_tx = stm32_sai_initialize(WM8994_SAI_BUS,
++                                     stm32_wm8994_sampleratecb);
++      if (!i2s_tx)
+         {
+-          auderr("stm32_sai_initialize failed\n");
++          auderr("stm32_sai_initialize (TX) failed\n");
+           ret = -ENODEV;
+           goto error;
+         }
+ 
+-      /* Now we can use these I2C and I2S interfaces to initialize the
+-       * CODEC which will return an audio interface.
++      /* Configure PLLI2S for 44100 Hz BEFORE enabling SAI, so the
++       * WM8994 receives the correct MCLK frequency (256 * 44100 =
++       * 11,289,600 Hz) during codec I2C register setup.  The codec
++       * uses MCLK1 directly (no FLL), so it must be correct from the
++       * start.  Then enable SAI2 Block A to output MCLK.
++       */
++
++      stm32_wm8994_sampleratecb(i2s_tx, 44100);
++
++      {
++        volatile uint32_t *sai2a_cr1 =
++          (volatile uint32_t *)STM32F7_SAI2_A_BASE;
++        *sai2a_cr1 |= SAI_CR1_SAIEN;
++      }
++
++      /* Initialize the WM8994 codec via I2C.  This configures all codec
++       * registers (output, input, clocking, etc).  We use the returned
++       * audio interface only for codec init - actual data flow goes
++       * through audio_i2s directly to SAI.
+        */
+ 
+-      wm8994 = wm8994_initialize(i2c, i2s, &g_wm8994.lower);
++      wm8994 = wm8994_initialize(i2c, i2s_tx, &g_wm8994.lower);
+       if (!wm8994)
+         {
+           auderr("wm8994_initialize failed\n");
+@@ -273,29 +292,49 @@ int stm32_wm8994_initialize(int minor)
+           goto error;
+         }
+ 
+-      /* No we can embed the WM8994/I2C/I2S conglomerate into a PCM decoder
+-       * instance so that we will have a PCM front end for the the WM8994
+-       * driver.
++      /* Register SAI2 Block A (TX) as playback device via audio_i2s.
++       * This bypasses the WM8994 driver's complex buffer management
++       * and PCM decoder wrapper, giving us direct DMA access.
+        */
+ 
+-      pcm = pcm_decode_initialize(wm8994);
+-      if (pcm == NULL)
++      play_dev = audio_i2s_initialize(i2s_tx, true);
++      if (play_dev == NULL)
+         {
+-          auderr("ERROR: Failed create the PCM decoder\n");
++          auderr("audio_i2s_initialize (TX) failed\n");
+           ret = -ENODEV;
+           goto error;
+         }
+ 
+-      /* Create a device name */
++      ret = audio_register("pcm0", play_dev);
++      if (ret < 0)
++        {
++          auderr("failed to register /dev/audio/pcm0: %d\n", ret);
++          goto error;
++        }
++
++      /* Initialize SAI2 Block B (RX) for recording */
+ 
+-      snprintf(devname, sizeof(devname), "pcm%d", minor);
++      i2s_rx = stm32_sai_initialize(WM8994_SAI_RX,
++                                     stm32_wm8994_sampleratecb);
++      if (!i2s_rx)
++        {
++          auderr("stm32_sai_initialize (RX) failed\n");
++          ret = -ENODEV;
++          goto error;
++        }
+ 
+-      /* Finally, we can register the ADAU1961/I2C/I2S audio device. */
++      record_dev = audio_i2s_initialize(i2s_rx, false);
++      if (record_dev == NULL)
++        {
++          auderr("audio_i2s_initialize (RX) failed\n");
++          ret = -ENODEV;
++          goto error;
++        }
+ 
+-      ret = audio_register(devname, pcm);
++      ret = audio_register("pcm1", record_dev);
+       if (ret < 0)
+         {
+-          auderr("failed to register /dev/%s device: %d\n", devname, ret);
++          auderr("failed to register /dev/audio/pcm1: %d\n", ret);
+           goto error;
+         }
+ 
+diff --git a/drivers/audio/wm8994.c b/drivers/audio/wm8994.c
+index 86fc2db97b..7ce887b026 100644
+--- a/drivers/audio/wm8994.c
++++ b/drivers/audio/wm8994.c
+@@ -72,8 +72,8 @@
+ #define WM8994_INPUT_DEVICE_INPUT_LINE_2                      ((uint16_t)0x0400)
+ #define WM8994_INPUT_DEVICE_DIGITAL_MIC1_MIC2                 ((uint16_t)0x0800)
+ 
+-#define WM8994_DEFAULT_OUTPUT_DEVICE                          (WM8994_OUTPUT_DEVICE_SPEAKER)
+-#define WM8994_DEFAULT_INPUT_DEVICE                           (WM8994_INPUT_DEVICE_DIGITAL_MIC1_MIC2)
++#define WM8994_DEFAULT_OUTPUT_DEVICE                          (WM8994_OUTPUT_DEVICE_HEADPHONE)
++#define WM8994_DEFAULT_INPUT_DEVICE                           (WM8994_INPUT_DEVICE_INPUT_LINE_1)
+ #define WM8994_STARTUP_MODE_COLD                              (1)
+ 
+ /****************************************************************************
+@@ -179,9 +179,7 @@ static void    *wm8994_workerthread(pthread_addr_t pvarg);
+ /* Initialization */
+ 
+ static void     wm8994_audio_output(FAR struct wm8994_dev_s *priv);
+-#if 0 /* Not used */
+ static void     wm8994_audio_input(FAR struct wm8994_dev_s *priv);
+-#endif
+ #ifdef WM8994_USE_FFLOCK_INT
+ static void     wm8994_configure_ints(FAR struct wm8994_dev_s *priv);
+ #else
+@@ -2220,26 +2218,80 @@ static void wm8994_audio_output(FAR struct wm8994_dev_s *priv)
+  *
+  */
+ 
+-#if 0 /* Not used */
+ static void wm8994_audio_input(FAR struct wm8994_dev_s *priv)
+ {
+-  /* Analogue Left Input 0  */
++  /* Configure LINE_IN_1 input path via raw register writes.
++   * The symbolic macros are not available in NuttX's WM8994 header.
++   */
++
++  /* Input Mixer 1: IN1LP/IN1LN to input mixer */
++
++  wm8994_writereg(priv, 0x028, 0x0011);
++
++  /* Input Mixer 3: IN1L_TO_MIXINL enabled, 0dB, NO output-to-input
++   * feedback.  Bits [2:0] = MIXOUTL_MIXINL_VOL must be 0 (muted)
++   * to prevent output mixer feeding back into input mixer.
++   * Old value 0x0025 had bits[2:0]=5 enabling feedback loop!
++   */
++
++  wm8994_writereg(priv, 0x029, 0x0020);
++
++  /* Input Mixer 4: IN1R_TO_MIXINR enabled, 0dB, no feedback */
++
++  wm8994_writereg(priv, 0x02a, 0x0020);
++
++  /* Power Management 4: Enable ADCL, ADCR, AIF1ADC1L, AIF1ADC1R */
++
++  wm8994_writereg(priv, 0x004, 0x0303);
+ 
+-  wm8994_writereg(priv, WM8994_ANA_LEFT_IN0, WM8994_INMUTE);
++  /* AIF1 DRC1: Enable DRC and signal detect (matches FreeRTOS/Zephyr) */
++
++  wm8994_writereg(priv, 0x440, 0x00db);
++
++  /* Power Management 2: Enable MIXINL, MIXINR, IN1L, IN1R, OPCLK */
++
++  wm8994_writereg(priv, 0x002, 0x6350);
++
++  /* AIF1 ADC1 Left Mixer Routing: ADC1L -> AIF1 */
++
++  wm8994_writereg(priv, 0x606, 0x0002);
++
++  /* AIF1 ADC1 Right Mixer Routing: ADC1R -> AIF1 */
++
++  wm8994_writereg(priv, 0x607, 0x0002);
++
++  /* GPIO 1 */
++
++  wm8994_writereg(priv, 0x700, 0x000d);
++
++  /* Left Line Input 1&2 Volume: -3dB (0x09), unmute.
++   * Was +9dB (0x11) matching Zephyr, but guitar clips at that level.
++   * R018 bits [4:0] = volume: 0x00=-16.5dB, 0x0B=0dB, 0x1F=+30dB
++   * Step size = 1.5 dB.  0x09 = -3dB.
++   */
+ 
+-  /* Analogue Right Input 0 */
++  wm8994_writereg(priv, 0x18, 0x000b);
+ 
+-  wm8994_writereg(priv, WM8994_ANA_RIGHT_IN0, WM8994_IN_VOL(5));
++  /* Right Line Input 1&2 Volume: 0dB, unmute */
+ 
+-  /* Analogue Left Input 1 */
++  wm8994_writereg(priv, 0x1a, 0x000b);
+ 
+-  wm8994_writereg(priv, WM8994_ANA_LEFT_IN1, 0);
++  /* ADC oversample enable - required for proper ADC operation */
+ 
+-  /* Analogue Right Input 1 */
++  wm8994_writereg(priv, 0x620, 0x0002);
+ 
+-  wm8994_writereg(priv, WM8994_ANA_RIGHT_IN1, WM8994_IP_SEL_N_IN2L);
++  /* AIF1 ADC1 HPF: enable high-pass filter */
++
++  wm8994_writereg(priv, 0x410, 0x1800);
++
++
++  /* Enable VMID and bias for input, preserving HPOUT bits set by
++   * wm8994_audio_output().  Read back current R001 to avoid clobbering.
++   */
++
++  priv->power_mgnt_reg_1 = wm8994_readreg(priv, 0x01) | 0x0013;
++  wm8994_writereg(priv, 0x01, priv->power_mgnt_reg_1);
+ }
+-#endif
+ 
+ /* Name: wm8994_configure_ints
+  *
+@@ -2523,7 +2575,7 @@ static void wm8994_hw_reset(FAR struct wm8994_dev_s *priv)
+         wm8994_writereg(priv, WM8994_AIF1_RATE, regval); /* 0x210 = 0x00a3 */
+         break;
+       case WM8994_AUDIO_FREQUENCY_44_100K:
+-        regval = WM8994_AIF1CLK_RATE_2 | WM8994_AIF1_SR_44K;
++        regval = WM8994_AIF1CLK_RATE_3 | WM8994_AIF1_SR_44K;
+         wm8994_writereg(priv, WM8994_AIF1_RATE, regval); /* 0x210 = 0x0013 */
+         break;
+       case WM8994_AUDIO_FREQUENCY_48K:
+@@ -2552,18 +2604,10 @@ static void wm8994_hw_reset(FAR struct wm8994_dev_s *priv)
+         break;
+     }
+ 
+-    if (WM8994_DEFAULT_INPUT_DEVICE == WM8994_INPUT_DEVICE_DIGITAL_MIC1_MIC2)
+-
+-        /* regval = 0x4018 */
+-
+-        regval = WM8994_AIF1ADCR_RIGHT_ADC | WM8994_AIF1_WL_16BITS
+-                                           | WM8994_AIF1_FMT_I2S;
+-    else
+-
+-        /* regval = 0x4010 */
++    /* AIF1 Control: I2S format, 16-bit, right ADC to right channel */
+ 
+-        regval = WM8994_AIF1ADCR_RIGHT_ADC | WM8994_AIF1_WL_16BITS
+-                                           | WM8994_AIF1_FMT_DSP;
++    regval = WM8994_AIF1ADCR_RIGHT_ADC | WM8994_AIF1_WL_16BITS
++                                       | WM8994_AIF1_FMT_I2S;
+ 
+     /* 0x300 = */
+ 
+@@ -2620,16 +2664,16 @@ static void wm8994_hw_reset(FAR struct wm8994_dev_s *priv)
+       wm8994_writereg(priv, WM8994_AIF1_DAC1_FILTERS1, regval); /* 0x420 = 0x0000 */
+     }
+ 
+-    regval = 0;
++    regval = 0x0300;
+     wm8994_writereg(priv, WM8994_PM3, regval); /* 0x03 = 0x0300 */
+ 
+-    regval = 0;
++    regval = 0x0000;
+     wm8994_writereg(priv, WM8994_SPKMIXL_ATT, regval); /* 0x22 = 0x0000 */
+ 
+-    regval = 0;
++    regval = 0x0000;
+     wm8994_writereg(priv, WM8994_SPKMIXR_ATT, regval); /* 0x23 = 0x0000 */
+ 
+-    regval = 0;
++    regval = 0x0300;
+     wm8994_writereg(priv, WM8994_SPEAKER_MIXER, regval); /* 0x36 = 0x0300 */
+ 
+     regval = 0;
+@@ -2645,21 +2689,21 @@ static void wm8994_hw_reset(FAR struct wm8994_dev_s *priv)
+     regval = priv->power_mgnt_reg_1;
+     wm8994_writereg(priv, WM8994_PM1, regval); /* 0x01 = power_mgnt_reg_1 */
+ 
+-    regval = 0;
++    regval = 0x0022;
+     wm8994_writereg(priv, WM8994_ANA_HP1, regval); /* 0x60 = 0x0022 */
+ 
+-    regval = 0;
++    regval = 0x9F25;
+     wm8994_writereg(priv, WM8994_CHARGE_PUMP1, regval); /* 0x4c = 0x9F25 */
+ 
+     up_mdelay(15);
+ 
+-    regval = 0;
++    regval = 0x0001;
+     wm8994_writereg(priv, WM8994_OUTPUT_MIXER1, regval); /* 0x2d = 0x0001 */
+ 
+-    regval = 0;
++    regval = 0x0001;
+     wm8994_writereg(priv, 0x2e, regval); /* 0x2e = 0x0001 */
+ 
+-    regval = 0;
++    regval = 0x0030 | 0x0300;
+     wm8994_writereg(priv, 0x03, regval); /* 0x03 = 0x0030 | 0x0300 */
+ 
+     regval = 0x0033;
+@@ -2737,6 +2781,7 @@ static void wm8994_hw_reset(FAR struct wm8994_dev_s *priv)
+   /* Configure the WM8994 hardware as an audio output device */
+ 
+   wm8994_audio_output(priv);
++  wm8994_audio_input(priv);
+ 
+   /* Configure interrupts */
+ 
+diff --git a/drivers/audio/wm8994.h b/drivers/audio/wm8994.h
+index 7f4918aa4e..6f3c344841 100644
+--- a/drivers/audio/wm8994.h
++++ b/drivers/audio/wm8994.h
+@@ -1566,7 +1566,7 @@
+ #define WM8994_AUDIO_FREQUENCY_96K              96000UL
+ #define WM8994_AUDIO_FREQUENCY_192K            192000UL
+ 
+-#define WM8994_DEFAULT_SAMPRATE                 (WM8994_AUDIO_FREQUENCY_48K)
++#define WM8994_DEFAULT_SAMPRATE                 (WM8994_AUDIO_FREQUENCY_44_100K)
+ 
+ #define WM8994_DEFAULT_NCHANNELS      0
+ #define WM8994_DEFAULT_BPSAMP      0
+-- 
+2.43.0
+

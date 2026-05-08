@@ -1,0 +1,38 @@
+lang: zig
+config_name: hiroic_zig
+description: "hIRoic Convolution Reverb (Zig)"
+zig:
+  src_dir: src
+  lib_name: hiroic_zig
+defconfig:
+  - CONFIG_OVE_BSP=y
+  - CONFIG_OVE_AUDIO=y
+  - CONFIG_OVE_FS=y
+  - CONFIG_OVE_LVGL=y
+  - CONFIG_OVE_QUEUE=y
+  - CONFIG_OVE_TIMER=y
+  - CONFIG_OVE_EVENTGROUP=y
+  - CONFIG_OVE_SHELL=y
+  - CONFIG_OVE_NVS=y
+  - CONFIG_OVE_WATCHDOG=y
+rtos_defconfig:
+  freertos:
+    - CONFIG_FREERTOS_TOTAL_HEAP_SIZE=65536
+  zephyr:
+    - CONFIG_ZEPHYR_HEAP_MEM_POOL_SIZE=32768
+kconfig: |
+  config DSP_BUFFER_SIZE
+  	int "DSP buffer size (samples)"
+  	default 512
+
+  config DSP_BITSIZE
+  	int "DSP bit depth"
+  	default 32
+
+  config DSP_RATE
+  	int "Sample rate (Hz)"
+  	default 44100
+
+  config IR_MAX_LEN
+  	int "Maximum IR length (samples)"
+  	default 1048
