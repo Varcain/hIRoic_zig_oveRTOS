@@ -14,6 +14,8 @@ const builtin = @import("builtin");
 const ove = @import("ove");
 const app_conf = @import("app_conf.zig");
 
+const log = std.log.scoped(.hiroic);
+
 pub var loaded_sample_rate: std.atomic.Value(u32) = std.atomic.Value(u32).init(0);
 
 const use_cmsis = builtin.target.cpu.arch == .thumb;
@@ -22,7 +24,7 @@ pub fn init() void {
     if (comptime use_cmsis) {
         arm_impl.init();
     } else {
-        ove.log.inf("DSP stub: passthrough mode", .{});
+        log.info("DSP stub: passthrough mode", .{});
     }
 }
 
@@ -41,7 +43,7 @@ pub fn loadIR(ir: []const i32, sample_rate: u32) void {
         arm_impl.loadIR(ir, sample_rate);
     } else {
         const len = @min(ir.len, app_conf.IR_MAX_LEN);
-        ove.log.inf("DSP stub: IR load ignored ({d} samples @ {d} Hz)", .{ len, sample_rate });
+        log.info("DSP stub: IR load ignored ({d} samples @ {d} Hz)", .{ len, sample_rate });
     }
 }
 
@@ -147,7 +149,7 @@ const arm_impl = if (use_cmsis) struct {
     fn setFftSize(s: *IrState, ir_len: u32) void {
         const min_fft = app_conf.DSP_BUFFER_SIZE + ir_len - 1;
         if (min_fft > FFT_CAP) {
-            ove.log.err("dsp: required FFT size {d} > {d}", .{ min_fft, FFT_CAP });
+            log.err("dsp: required FFT size {d} > {d}", .{ min_fft, FFT_CAP });
             s.fft_size = 0;
             s.overlap_size = 0;
             s.fft_log2n = 0;
@@ -238,13 +240,13 @@ const arm_impl = if (use_cmsis) struct {
 
         var actual_len: u32 = @intCast(ir.len);
         if (actual_len > app_conf.IR_MAX_LEN) {
-            ove.log.wrn("dsp: IR len {d} > {d}, truncating", .{
+            log.warn("dsp: IR len {d} > {d}, truncating", .{
                 actual_len, app_conf.IR_MAX_LEN,
             });
             actual_len = @intCast(app_conf.IR_MAX_LEN);
         }
         if (sample_rate != app_conf.DSP_RATE) {
-            ove.log.wrn("dsp: IR rate {d} != {d}", .{ sample_rate, app_conf.DSP_RATE });
+            log.warn("dsp: IR rate {d} != {d}", .{ sample_rate, app_conf.DSP_RATE });
         }
 
         const active = active_ir.load(.acquire);
@@ -252,7 +254,7 @@ const arm_impl = if (use_cmsis) struct {
 
         setFftSize(staging, actual_len);
         const instance = staging.fft_instance orelse {
-            ove.log.err("dsp: FFT init failed, len {d}", .{actual_len});
+            log.err("dsp: FFT init failed, len {d}", .{actual_len});
             return;
         };
 
@@ -322,7 +324,7 @@ const arm_impl = if (use_cmsis) struct {
         // Publish: release-store pairs with process()'s acquire-load.
         active_ir.store(staging, .release);
 
-        ove.log.inf(
+        log.info(
             "dsp: IR loaded, {d} samples, FFT {d}, boost {d}, gain {d}",
             .{ actual_len, staging.fft_size, staging.ir_boost_bits, 2 * staging.fft_log2n + 2 - staging.ir_boost_bits },
         );

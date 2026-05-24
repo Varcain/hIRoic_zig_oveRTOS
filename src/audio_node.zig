@@ -17,8 +17,7 @@ pub const HiroicDsp = struct {
         const src = input.dataS16();
         const dst = output.dataS16Mut();
 
-        var start: u64 = 0;
-        _ = ove.ffi.ove_time_get_us(&start);
+        const start = ove.time.getUs() catch 0;
 
         shared.rx_peak.store(peakAbs(src), .monotonic);
 
@@ -35,8 +34,7 @@ pub const HiroicDsp = struct {
             @memcpy(dst[0..n], src[0..n]);
         }
 
-        var end: u64 = 0;
-        _ = ove.ffi.ove_time_get_us(&end);
+        const end = ove.time.getUs() catch start;
         _ = shared.total_proc_us.fetchAdd(@intCast(end - start), .monotonic);
         _ = shared.proc_count.fetchAdd(1, .monotonic);
 

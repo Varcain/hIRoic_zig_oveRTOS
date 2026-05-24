@@ -8,6 +8,8 @@ const app_conf = @import("app_conf.zig");
 const wav = @import("wav_parser.zig");
 const ir_convert = @import("ir_convert.zig");
 
+const log = std.log.scoped(.hiroic);
+
 // Cortex-M7 cache-line alignment is required for SDMMC DMA: Zephyr's
 // STM32 SDMMC driver does sys_cache_data_invd_range() over the user
 // buffer after each DMA read, which corrupts adjacent globals living
@@ -19,16 +21,15 @@ var current_name: [64]u8 = [_]u8{0} ** 64;
 var available: bool = false;
 
 pub fn init() void {
-    const rc = ove.ffi.ove_fs_mount(null, null);
-    if (rc != 0) {
-        ove.log.wrn("ir_mgr: fs mount failed (SD not available)", .{});
+    ove.fs.mount("", "") catch {
+        log.warn("ir_mgr: fs mount failed (SD not available)", .{});
         return;
-    }
+    };
     const default = "default";
     @memcpy(current_name[0..default.len], default);
     current_name[default.len] = 0;
     available = true;
-    ove.log.inf("ir_mgr: ready", .{});
+    log.info("ir_mgr: ready", .{});
 }
 
 pub fn isAvailable() bool {
@@ -61,7 +62,7 @@ fn loadFile(name: []const u8, size: usize, ir: []i32) ?ir_convert.Converted {
     const path_z = path.cStr() catch return null;
 
     var file = ove.fs.File.open(path_z, ove.fs.O_READ) catch {
-        ove.log.err("ir_mgr: open failed", .{});
+        log.err("ir_mgr: open failed", .{});
         return null;
     };
     defer file.close();
@@ -73,17 +74,6 @@ fn loadFile(name: []const u8, size: usize, ir: []i32) ?ir_convert.Converted {
     const converted = ir_convert.convertSamples(parsed, ir) catch return null;
     setCurrent(name);
     return converted;
-}
-
-fn forEachWav(ctx: anytype, comptime callback: fn (@TypeOf(ctx), name: []const u8, size: usize) bool) void {
-    var dir = ove.fs.Dir.open("/") catch return;
-    defer dir.close();
-
-    while (dir.readEntry() catch null) |entry| {
-        const name = std.mem.sliceTo(&entry.name, 0);
-        if (!ir_convert.isWav(name)) continue;
-        if (!callback(ctx, name, entry.size)) break;
-    }
 }
 
 pub fn count() u32 {

@@ -18,8 +18,20 @@ defconfig:
 rtos_defconfig:
   freertos:
     - CONFIG_FREERTOS_TOTAL_HEAP_SIZE=65536
+  # Zig's `Thread(N).spawn` / `Queue.create` / `Timer.create` route
+  # through `std.mem.Allocator` → libc `malloc`.  On Zephyr that's the
+  # picolibc malloc backed by sbrk over RAM left after the static
+  # image — *not* the kernel `k_malloc` heap.  So a big
+  # `HEAP_MEM_POOL_SIZE` would *starve* sbrk: every byte added to the
+  # kernel heap is a byte removed from the libc arena.
+  #
+  # The Zig port's worst case is ~90 KB (four threads with Zephyr's
+  # power-of-2 stack alignment burns ~33 KB per Thread(8192) once the
+  # binding's libc over-align dance is counted).  Keep `HEAP_MEM_POOL`
+  # tiny (just for Zephyr fs handles) so sbrk has the remaining
+  # ~140 KB free for libc malloc.
   zephyr:
-    - CONFIG_ZEPHYR_HEAP_MEM_POOL_SIZE=32768
+    - CONFIG_ZEPHYR_HEAP_MEM_POOL_SIZE=8192
 kconfig: |
   config DSP_BUFFER_SIZE
   	int "DSP buffer size (samples)"

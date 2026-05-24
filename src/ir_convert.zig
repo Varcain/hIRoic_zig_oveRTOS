@@ -1,7 +1,8 @@
 const std = @import("std");
-const ove = @import("ove");
 const app_conf = @import("app_conf.zig");
 const wav = @import("wav_parser.zig");
+
+const log = std.log.scoped(.hiroic);
 
 pub const Converted = struct {
     length: u32,
@@ -68,7 +69,7 @@ pub fn convertSamples(data: wav.WavData, ir: []i32) ConvertError!Converted {
         }
     }
 
-    ove.log.inf("ir: converted {d} samples @ {d} Hz", .{
+    log.info("ir: converted {d} samples @ {d} Hz", .{
         data.num_samples, data.sample_rate,
     });
     return Converted{ .length = data.num_samples, .sample_rate = data.sample_rate };

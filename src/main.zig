@@ -10,12 +10,29 @@ const shared = @import("shared.zig");
 const threads = @import("threads.zig");
 const ui = @import("ui.zig");
 
-const prio = ove.thread.prio;
+// Wire `std.log.*` calls through ove_console_write so module code can
+// use the standard library facade (`const log = std.log.scoped(...)`)
+// instead of a custom logger.
+pub const std_options: std.Options = .{
+    .logFn = ove.log.logFn,
+};
+
+const log = std.log.scoped(.hiroic);
 
 // Graph outlives appMain(): the audio-I/O threads hold references to it,
-// so it needs static storage — same C rule as "don't return a pointer to
-// a local".  File-scope `var` keeps it in BSS for the program's lifetime.
+// so it needs static storage — same Zig rule as "don't return a pointer
+// to a local".  File-scope `var` keeps it in BSS for the program's
+// lifetime.
 var g_graph: ove.audio.Graph = undefined;
+
+// Threads also outlive appMain.  Their backing storage (TCB + stack)
+// is allocator-owned and freed in `Thread.deinit`; we keep the
+// wrapper values at file scope so they don't go out of scope and
+// trigger deinit while the program is still running.
+var g_heartbeat_th: ove.Thread(2048) = undefined;
+var g_graphics_th: ove.Thread(8192) = undefined;
+var g_input_th: ove.Thread(4096) = undefined;
+var g_loader_th: ove.Thread(8192) = undefined;
 
 fn statsTimerCb() void {
     const deadline_us: u32 = (app_conf.DSP_BUFFER_SIZE * 1_000_000) / app_conf.DSP_RATE;
@@ -36,33 +53,45 @@ fn statsTimerCb() void {
 }
 
 fn appMain() void {
-    ove.log.inf("hIRoic - Guitar Cabinet IR Convolution (Zig)", .{});
-    ove.log.inf("Config: 16-bit, 1 ch, {d} Hz, {d} samples/block", .{
+    // All RTOS primitives that need an allocator (Queue, Timer, Thread,
+    // EventGroup, …) take a `std.mem.Allocator`.  Under heap mode use
+    // the libc-backed allocator; zero-heap requires a static-backed
+    // FixedBufferAllocator, which we set up via comptime cfg in a
+    // follow-up.  hIRoic is heap-mode only (per app.yaml).
+    const allocator = ove.allocators.c_allocator;
+
+    log.info("hIRoic - Guitar Cabinet IR Convolution (Zig)", .{});
+    log.info("Config: 16-bit, 1 ch, {d} Hz, {d} samples/block", .{
         app_conf.DSP_RATE, app_conf.DSP_BUFFER_SIZE,
     });
 
     dsp.init();
     ir_manager.init();
 
-    shared.events = ove.EventGroup.create() catch {
-        ove.log.err("create event group failed", .{});
+    shared.events = ove.EventGroup.create(allocator) catch {
+        log.err("create event group failed", .{});
         return;
     };
-    shared.loader_queue = ove.Queue(shared.IrLoadRequest, 4).create() catch {
-        ove.log.err("create queue failed", .{});
+    shared.loader_queue = ove.Queue(shared.IrLoadRequest, 4).create(allocator) catch {
+        log.err("create queue failed", .{});
         return;
     };
     // Watchdog hardware is optional: a board built without an enabled
     // IWDG/WWDG (NuttX) or `watchdog0` DT alias (Zephyr) returns
-    // NotSupported from `_create`/`_init`.  Don't bail out — leave
+    // NotSupported from `_create`.  Don't bail out — leave
     // `shared.watchdog = null` so `shared.watchdogFeed()` becomes a
     // no-op and the watchdog `.start()` site below skips cleanly.
     shared.watchdog = ove.Watchdog.create(5000) catch |e| blk: {
-        ove.log.wrn("watchdog create failed ({s}); continuing without it", .{@errorName(e)});
+        log.warn("watchdog create failed ({s}); continuing without it", .{@errorName(e)});
         break :blk null;
     };
-    shared.stats_timer = ove.Timer.create(statsTimerCb, 1000, .periodic) catch {
-        ove.log.err("create stats timer failed", .{});
+    shared.stats_timer = ove.Timer.create(
+        allocator,
+        .{ .period_ms = 1000, .mode = .periodic },
+        statsTimerCb,
+        .{},
+    ) catch {
+        log.err("create stats timer failed", .{});
         return;
     };
 
@@ -72,70 +101,91 @@ fn appMain() void {
     // and sample width are inferred from the per-node `addProcessor` /
     // `deviceSource` / `deviceSink` calls and the cfg passed to them.
     g_graph.init(app_conf.DSP_BUFFER_SIZE) catch {
-        ove.log.err("audio graph init failed", .{});
+        log.err("audio graph init failed", .{});
         return;
     };
-    const graph = &g_graph;
 
     const cfg = ove.audio.Graph.deviceCfgI2s(app_conf.DSP_RATE, 1, 0);
-    const src_idx = graph.deviceSource(&cfg, "i2s-in") catch {
-        ove.log.err("i2s-in source failed", .{});
+    const src_idx = g_graph.deviceSource(&cfg, "i2s-in") catch {
+        log.err("i2s-in source failed", .{});
         return;
     };
-    const dsp_idx = graph.addProcessor(
+    const dsp_idx = g_graph.addProcessor(
         audio_node.HiroicDsp,
         &audio_node.dsp_node,
         "dsp",
     ) catch {
-        ove.log.err("dsp processor failed", .{});
+        log.err("dsp processor failed", .{});
         return;
     };
-    const sink_idx = graph.deviceSink(&cfg, "i2s-out") catch {
-        ove.log.err("i2s-out sink failed", .{});
+    const sink_idx = g_graph.deviceSink(&cfg, "i2s-out") catch {
+        log.err("i2s-out sink failed", .{});
         return;
     };
-    graph.connect(@intCast(src_idx), @intCast(dsp_idx)) catch {
-        ove.log.err("connect src->dsp failed", .{});
+    g_graph.connect(@intCast(src_idx), @intCast(dsp_idx)) catch {
+        log.err("connect src->dsp failed", .{});
         return;
     };
-    graph.connect(@intCast(dsp_idx), @intCast(sink_idx)) catch {
-        ove.log.err("connect dsp->sink failed", .{});
+    g_graph.connect(@intCast(dsp_idx), @intCast(sink_idx)) catch {
+        log.err("connect dsp->sink failed", .{});
         return;
     };
-    graph.build() catch {
-        ove.log.err("audio graph build failed", .{});
+    g_graph.build() catch {
+        log.err("audio graph build failed", .{});
         return;
     };
 
     if (shared.watchdog) |wd| {
-        wd.start() catch ove.log.wrn("watchdog start failed", .{});
+        wd.start() catch log.warn("watchdog start failed", .{});
     }
-    shared.stats_timer.?.start() catch ove.log.wrn("stats timer start failed", .{});
+    if (shared.stats_timer) |t| {
+        t.start() catch log.warn("stats timer start failed", .{});
+    }
 
     commands.registerAll();
     commands.restoreFromNvs();
 
-    // `ove.Thread(STACK).create(name, entry, prio)` — stack size is a
-    // comptime parameter on the template; `create` no longer takes it.
-    _ = ove.Thread(2048).create("Heartbeat", threads.heartbeatEntry, prio.high) catch {
-        ove.log.err("spawn heartbeat failed", .{});
+    // Cooperative-cancellation workers — entry functions take a
+    // `StopToken` so they exit cleanly if `deinit` is ever called.
+    g_heartbeat_th = ove.Thread(2048).spawn(
+        allocator,
+        .{ .name = "Heartbeat", .priority = .high },
+        threads.heartbeatEntry,
+        .{},
+    ) catch {
+        log.err("spawn heartbeat failed", .{});
         return;
     };
-    _ = ove.Thread(8192).create("Graphics", threads.graphicsEntry, prio.normal) catch {
-        ove.log.err("spawn graphics failed", .{});
+    g_graphics_th = ove.Thread(8192).spawn(
+        allocator,
+        .{ .name = "Graphics", .priority = .normal },
+        threads.graphicsEntry,
+        .{},
+    ) catch {
+        log.err("spawn graphics failed", .{});
         return;
     };
-    _ = ove.Thread(4096).create("Inputs", threads.inputEntry, prio.above_normal) catch {
-        ove.log.err("spawn inputs failed", .{});
+    g_input_th = ove.Thread(4096).spawn(
+        allocator,
+        .{ .name = "Inputs", .priority = .above_normal },
+        threads.inputEntry,
+        .{},
+    ) catch {
+        log.err("spawn inputs failed", .{});
         return;
     };
-    _ = ove.Thread(8192).create("Loader", threads.loaderEntry, prio.high) catch {
-        ove.log.err("spawn loader failed", .{});
+    g_loader_th = ove.Thread(8192).spawn(
+        allocator,
+        .{ .name = "Loader", .priority = .high },
+        threads.loaderEntry,
+        .{},
+    ) catch {
+        log.err("spawn loader failed", .{});
         return;
     };
 
     ove.lvgl.init() catch {
-        ove.log.wrn("lvgl: init failed (UI disabled)", .{});
+        log.warn("lvgl: init failed (UI disabled)", .{});
     };
     {
         const guard = ove.lvgl.lock();
@@ -143,16 +193,20 @@ fn appMain() void {
         ui.createWidgets("hIRoic");
     }
 
-    graph.start() catch {
-        ove.log.err("audio graph start failed", .{});
+    // Start the audio graph LAST.  On Zephyr the SAI driver uses one-
+    // shot DMA: if the TX queue drains before the audio thread gets CPU
+    // time (e.g. because main is still running higher-priority init
+    // work like LVGL setup), the RX clock dies too.  Matching the C
+    // reference's "start_graph immediately before scheduler" ordering
+    // avoids the race.
+    g_graph.start() catch {
+        log.err("audio graph start failed", .{});
         return;
     };
 
-    ove.log.inf("init: done", .{});
+    log.info("init: done", .{});
 
     ove.run();
-
-    graph.stop() catch {};
 }
 
 comptime {

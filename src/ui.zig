@@ -2,6 +2,8 @@ const std = @import("std");
 const ove = @import("ove");
 const lvgl = ove.lvgl;
 
+const log = std.log.scoped(.hiroic);
+
 var cpu_label: ?lvgl.Label = null;
 var ir_label: ?lvgl.Label = null;
 var vu_bar: ?lvgl.Bar = null;
@@ -37,7 +39,7 @@ pub fn createWidgets(title: [*:0]const u8) void {
         .size(200, 12)
         .pos(10, 105);
 
-    ove.log.inf("LVGL widgets created", .{});
+    log.info("LVGL widgets created", .{});
 }
 
 pub fn updateCpu(pct: u32) void {
